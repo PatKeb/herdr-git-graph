@@ -2,6 +2,7 @@ import { View, div, svg, PathBuilder } from "gpui-kit";
 import { v_flex, h_flex, Scrollbar, v_virtual_list } from "gpui-base";
 import { spaces, panes, focused, exec, watchFolder, theme, settings, run, props, openOverlay, notify } from "herdr";
 import { menuItems, menuHeight, renderMenu } from "./menu.js";
+import { diffRows, diffRow } from "./diff.js";
 
 const LIMIT = 300;
 const ROW = 26;
@@ -374,17 +375,10 @@ export default class GitGraph extends View {
         // From the first hunk: the "diff --git", "index" and "---/+++" lines say nothing the header doesn't.
         const start = all.findIndex((l) => l.startsWith("@@") || l.startsWith("Binary files"));
         const lines = start < 0 ? [r.stderr.trim() || "No changes"] : all.slice(start);
-        this.diff.lines = lines.length > DIFF_LINES ? [...lines.slice(0, DIFF_LINES), `… ${lines.length - DIFF_LINES} more lines (Open in terminal)`] : lines;
-      } catch (e) { if (this.diff?.path === f.path) this.diff.lines = [String(e.message ?? e)]; }
+        this.diff.rows = diffRows(lines.length > DIFF_LINES ? [...lines.slice(0, DIFF_LINES), `… ${lines.length - DIFF_LINES} more lines (Open in terminal)`] : lines);
+      } catch (e) { if (this.diff?.path === f.path) this.diff.rows = diffRows([String(e.message ?? e)]); }
       cx.notify();
     });
-  }
-
-  diffLine(line, i, t) {
-    const color = line.startsWith("@@") ? t.ansi6 : line.startsWith("+") ? t.ansi2 : line.startsWith("-") ? t.ansi1 : t.foreground;
-    return div().id(`diff-${i}`).h(16).flex_none().whitespace_nowrap().text_color(color)
-      .when(line.startsWith("@@"), (e) => e.mt(i ? 6 : 0))
-      .child(line.replace(/\t/g, "    ").replace(/ /g, " ") || " ");
   }
 
   // One changed file: what happened to it, its folder dim and its name bright, the lines it changes.
@@ -547,8 +541,8 @@ export default class GitGraph extends View {
             .child(this.diff ? this.diff.path : this.picked === "wip" ? this.wipTitle() : this.files ? this.filesTitle(this.rows.find((r) => r.hash === this.picked)?.ref ?? this.picked.slice(0, 10)) : this.picked))
           .child(button("detail-open", "Open in terminal", false).on_click(() => this.open()))
           .child(button("detail-close", "×", false).on_click((_e, cx) => { this.picked = null; this.detail = null; this.files = null; this.diff = null; cx.notify(); })))
-        .when(Boolean(this.diff), (e) => e.child(v_flex().id("git-graph-diff").flex_1().min_h(0).overflow_scroll().px(12).pb(8).font_family(font).text_size(11)
-          .children((this.diff?.lines ?? ["Loading…"]).map((line, i) => this.diffLine(line, i, t)))))
+        .when(Boolean(this.diff), (e) => e.child(v_flex().id("git-graph-diff").flex_1().min_h(0).overflow_y_scrollbar().pb(8).font_family(font).text_size(11.5)
+          .children((this.diff?.rows ?? diffRows(["Loading…"])).map((r, i) => diffRow(r, i, t)))))
         .when(!this.diff, (e) => e.child(v_flex().id("git-graph-detail").flex_1().min_h(0).overflow_y_scrollbar().px(12).pb(8)
           .when(!this.files || Boolean(this.detail), (e) => e.children((this.detail ?? ["Loading…"]).map((line, i) => div().h(16).flex_none().truncate().font_family(font).text_size(11)
             .text_color(i < 2 ? t.muted : t.foreground).child(line.replace(/ /g, " ") || " "))))
