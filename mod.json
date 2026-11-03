@@ -1,1 +1,1 @@
-{ "place": "none", "title": "Git graph", "overlay": { "kind": "window", "key": "git-graph", "keep": true, "width": 640, "height": 0.75 } }
+{ "place": "none", "title": "Git graph" }
