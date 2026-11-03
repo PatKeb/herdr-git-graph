@@ -218,6 +218,20 @@ export default class GitGraph extends View {
     });
   }
 
+  // On a detached HEAD, the local branches that go on from it, so checking out an older commit
+  // doesn't hide the newer ones. Several such branches: the one last left by a checkout, if it's one of them.
+  async aheadOfDetached(git, root, branch) {
+    if (branch) return [];
+    const contains = await git(["for-each-ref", "--contains", "HEAD", "--format=%(refname:short)", "refs/heads"], root);
+    const tips = contains.code === 0 ? contains.stdout.split("\n").filter(Boolean) : [];
+    if (tips.length > 1) {
+      const reflog = await git(["reflog", "-n", "100", "--format=%gs"], root);
+      const left = reflog.stdout.split("\n").map((l) => l.match(/^checkout: moving from (\S+) to /)?.[1]).find((n) => n && tips.includes(n));
+      if (left) return [`refs/heads/${left}`];
+    }
+    return tips.map((n) => `refs/heads/${n}`);
+  }
+
   refresh(cx) {
     if (this.loading) { this.again = true; return; }
     const { cwd, on } = location(), context = key();
@@ -251,7 +265,7 @@ export default class GitGraph extends View {
         const branch = await git(["branch", "--show-current"], root);
         const heads = await git(["for-each-ref", "--format=%(refname:short)", "refs/heads"], root);
         // Stashes are drawn as their own rows, not as the commits git keeps them in.
-        const refs = this.all ? ["--exclude=refs/stash", "--all"] : ["HEAD", ...(this.base ? [this.base] : [])];
+        const refs = this.all ? ["--exclude=refs/stash", "--all"] : ["HEAD", ...(this.base ? [this.base] : []), ...await this.aheadOfDetached(git, root, branch.stdout.trim())];
         const [log, status, stash] = await Promise.all([
           git(["log", "--date-order", `--format=${FORMAT}`, "-n", String(LIMIT), ...refs, "--"], root),
           git(["status", "--porcelain"], root),
