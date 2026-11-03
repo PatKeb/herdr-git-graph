@@ -14,7 +14,11 @@ const K = 0.5523;     // cubic bezier handle for a quarter circle
 // Reads write nothing under .git, so the folder watch never triggers itself.
 const READ = ["--no-optional-locks", "-c", "core.fsmonitor=false"];
 const SEP = "\u0001";
-const FORMAT = `%H${SEP}%h${SEP}%P${SEP}%D${SEP}%s${SEP}%an${SEP}%cr`;
+const FORMAT = `%H${SEP}%h${SEP}%P${SEP}%D${SEP}%s${SEP}%an${SEP}%cr${SEP}%ct`;
+const STASHES = `%H${SEP}%gd${SEP}%P${SEP}%gs${SEP}%cr${SEP}%ct`;
+const DASH = [2, 4.5];  // dotted lanes (working directory, stashes); 26px rows hold whole periods
+// Paths whose changes don't change what the graph shows (build output, dependencies, git's objects).
+const NOISE = /\/(node_modules|\.nuxt|\.output|\.next|dist|\.cache|\.turbo)\/|\/\.git\/objects\//;
 const PALETTE = ["ansi4", "ansi2", "ansi3", "ansi5", "ansi6", "ansi1", "ansi11", "ansi13", "ansi14", "ansi9", "ansi10", "ansi12"];
 
 // The repo the panel shows: the focused terminal's folder, else the space's.
@@ -35,8 +39,69 @@ function parseRefs(text) {
   });
 }
 
+// `git status --porcelain` as counts: modified, added (new or untracked), deleted.
+function statusCounts(text) {
+  const n = { modified: 0, added: 0, deleted: 0 };
+  for (const line of text.split("\n")) {
+    if (!line) continue;
+    const xy = line.slice(0, 2);
+    if (xy === "??" || xy.includes("A")) n.added++;
+    else if (xy.includes("D")) n.deleted++;
+    else n.modified++;
+  }
+  return n.modified + n.added + n.deleted ? n : null;
+}
+
+// The working directory's files for its detail: { path, kind: "added" | "deleted" | "modified", add, del,
+// binary }, with lines added and deleted against HEAD (a new file: all its lines, for the first UNCOUNTED).
+const UNCOUNTED = 60;
+async function workingFiles(git) {
+  const status = await git(["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"]);
+  if (status.code !== 0) throw new Error(status.stderr.trim());
+  const head = await git(["rev-parse", "--verify", "--quiet", "HEAD"]);
+  const diffs = head.code === 0 ? [await git(["diff", "HEAD", "--numstat", "-z", "--no-renames"])]
+    : [await git(["diff", "--cached", "--numstat", "-z", "--no-renames"]), await git(["diff", "--numstat", "-z", "--no-renames"])];
+  const stats = {};
+  for (const r of diffs) for (const entry of r.stdout.split("\0")) {
+    const [a, d, ...rest] = entry.split("\t");
+    if (!rest.length) continue;
+    const path = rest.join("\t"), old = stats[path] ?? { add: 0, del: 0 };
+    stats[path] = { add: old.add + (Number(a) || 0), del: old.del + (Number(d) || 0), binary: a === "-" };
+  }
+  const files = status.stdout.split("\0").filter(Boolean).slice(0, 1000).map((entry) => {
+    const xy = entry.slice(0, 2), path = entry.slice(3);
+    const kind = xy === "??" || xy.includes("A") ? "added" : xy.includes("D") ? "deleted" : "modified";
+    return { path, kind, untracked: xy === "??", ...(stats[path] ?? { add: 0, del: 0, binary: false }) };
+  });
+  // Git doesn't diff untracked files; ask it to, against nothing, for the first few.
+  await Promise.all(files.filter((f) => f.untracked).slice(0, UNCOUNTED).map(async (f) => {
+    const r = await git(["diff", "--no-index", "--numstat", "--", "/dev/null", f.path]);
+    const [a] = r.stdout.split("\t");
+    if (a === "-") f.binary = true; else f.add = Number(a) || 0;
+  }));
+  return files;
+}
+
+// Adds the rows that aren't commits: the working directory's changes on top, waiting for HEAD, and each
+// stash by its date, above the commit it was made on (stashes whose commit isn't shown are left out).
+function withPending(commits, wip, stashes) {
+  const out = commits.slice();
+  for (const st of stashes) {
+    const base = out.findIndex((c) => c.hash === st.parents[0]);
+    if (base < 0) continue;
+    let i = out.findIndex((c) => c.kind !== "stash" && c.time < st.time);
+    if (i < 0 || i > base) i = base;
+    out.splice(i, 0, st);
+  }
+  if (wip) {
+    const head = commits.find((c) => c.refs.some((r) => r.kind === "head"));
+    out.unshift({ key: "wip", hash: "wip", kind: "wip", short: "", parents: head ? [head.hash] : [], refs: [], subject: "// WIP", author: "", when: "", counts: wip });
+  }
+  return out;
+}
+
 // Lays the commits out on lanes, GitKraken style: each lane (column) waits for one commit and runs
-// straight down. A commit takes the leftmost lane waiting for it; other lanes waiting for it end in an
+// straight down. A commit takes the leftmost lane waiting for it (a solid one before a dotted one); other lanes waiting for it end in an
 // elbow into its dot ("in"). It hands its lane to its first parent and opens or joins lanes for the
 // other parents with an elbow out of its dot ("out"). Lanes never shift sideways between rows, so the
 // only bends are those elbows, on the commit's own row. Several lanes may wait for the same commit
@@ -49,33 +114,37 @@ function layout(commits) {
     while (cur && cur !== target && at.has(cur) && at.get(cur) < at.get(target)) cur = byHash.get(cur)?.parents[0];
     return cur === target;
   };
-  let lanes = [], colors = [], paint = 0, width = 1;
+  // `dashes[k]`: lane k comes from the working directory or a stash and is drawn dotted.
+  let lanes = [], colors = [], dashes = [], paint = 0, width = 1;
   const nextColor = () => PALETTE[paint++ % PALETTE.length];
   const rows = commits.map((c) => {
-    const top = lanes, topColors = colors;
-    const next = top.slice(), nextColors = topColors.slice();
+    const top = lanes, topColors = colors, topDashes = dashes, pending = Boolean(c.kind);
+    const next = top.slice(), nextColors = topColors.slice(), nextDashes = topDashes.slice();
     // A new lane takes the first free column, also one a lane ending on this row frees: its elbow in
     // and the new elbow out meet at the dot in a "}".
     const open = (hash) => {
       let k = next.indexOf(null);
       if (k < 0) k = next.length;
-      next[k] = hash; nextColors[k] = nextColor();
+      next[k] = hash; nextColors[k] = pending ? "muted" : nextColor(); nextDashes[k] = pending;
       return k;
     };
     const waiting = [];
     top.forEach((h, k) => { if (h === c.hash) waiting.push(k); });
     const fresh = !waiting.length;
-    const idx = fresh ? open(c.hash) : waiting[0];
-    const color = nextColors[idx];
+    // Its own lane rather than a dotted one, so a stash or the working directory bends into it.
+    const idx = fresh ? open(c.hash) : (waiting.find((k) => !topDashes[k]) ?? waiting[0]);
     const lines = [];
-    for (const k of waiting.slice(1)) { next[k] = null; nextColors[k] = null; lines.push({ from: k, to: idx, color: topColors[k], kind: "in" }); }
+    // A commit reached by a dotted lane carries on in a colour of its own.
+    if (!fresh && topDashes[idx]) { nextColors[idx] = nextColor(); nextDashes[idx] = false; }
+    const color = nextColors[idx];
+    for (const k of waiting.filter((k) => k !== idx)) { next[k] = null; nextColors[k] = null; nextDashes[k] = false; lines.push({ from: k, to: idx, color: topColors[k], dashed: topDashes[k], kind: "in" }); }
     for (let k = 0; k < top.length; k++) {
-      if (top[k] !== null && top[k] !== c.hash) lines.push({ from: k, to: k, color: topColors[k], kind: "through" });
+      if (top[k] !== null && top[k] !== c.hash) lines.push({ from: k, to: k, color: topColors[k], dashed: topDashes[k], kind: "through" });
     }
-    if (!fresh) lines.push({ from: idx, to: idx, color, kind: "in" });
+    if (!fresh) lines.push({ from: idx, to: idx, color: topColors[idx], dashed: topDashes[idx], kind: "in" });
     const [first, ...rest] = c.parents;
     next[idx] = first ?? null;
-    if (first) lines.push({ from: idx, to: idx, color, kind: "out" });
+    if (first) lines.push({ from: idx, to: idx, color, dashed: pending, kind: "out" });
     else nextColors[idx] = null;
     for (const p of rest) {
       let k = next.findIndex((h, i) => h === p && i !== idx);
@@ -84,9 +153,9 @@ function layout(commits) {
       if (k < 0) k = open(p);
       lines.push({ from: idx, to: k, color: nextColors[k], kind: "out" });
     }
-    while (next.length && next[next.length - 1] === null) { next.pop(); nextColors.pop(); }
+    while (next.length && next[next.length - 1] === null) { next.pop(); nextColors.pop(); nextDashes.pop(); }
     width = Math.max(width, top.length, next.length);
-    lanes = next; colors = nextColors;
+    lanes = next; colors = nextColors; dashes = nextDashes;
     return { ...c, lane: idx, color, lines };
   });
   return { rows, width };
@@ -107,8 +176,8 @@ export default class GitGraph extends View {
     cx.spawn(async (cx) => {
       try {
         while (this.watched === dir) {
-          await watchFolder(dir);
-          if (this.watched === dir) this.refresh(cx);
+          const paths = await watchFolder(dir);
+          if (this.watched === dir && (paths.includes(dir) || paths.some((p) => !NOISE.test(p)))) this.refresh(cx);
         }
       } catch { this.watched = null; }
     });
@@ -130,7 +199,7 @@ export default class GitGraph extends View {
           const top = await git(["rev-parse", "--show-toplevel", "--absolute-git-dir"]);
           if (key() !== context) return;
           if (top.code !== 0) { this.error = "Not a git repository"; return; }
-          const [root, gitDir] = top.stdout.trim().split("\n");
+          const [root] = top.stdout.trim().split("\n");
           this.root = root; this.on = on;
           // The branch the current one is compared against: origin's default, else main/master.
           const head = await git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], root);
@@ -140,24 +209,38 @@ export default class GitGraph extends View {
             if ((await git(["rev-parse", "--verify", "--quiet", name], root)).code === 0) base = name;
           }
           this.base = base;
-          this.watch(gitDir, cx);
+          // The whole checkout, so edits show up in the working directory row at once.
+          this.watch(root, cx);
         }
         const root = this.root;
         const branch = await git(["branch", "--show-current"], root);
         const heads = await git(["for-each-ref", "--format=%(refname:short)", "refs/heads"], root);
-        const refs = this.all ? ["--all"] : ["HEAD", ...(this.base ? [this.base] : [])];
-        const log = await git(["log", "--date-order", `--format=${FORMAT}`, "-n", String(LIMIT), ...refs, "--"], root);
+        // Stashes are drawn as their own rows, not as the commits git keeps them in.
+        const refs = this.all ? ["--exclude=refs/stash", "--all"] : ["HEAD", ...(this.base ? [this.base] : [])];
+        const [log, status, stash] = await Promise.all([
+          git(["log", "--date-order", `--format=${FORMAT}`, "-n", String(LIMIT), ...refs, "--"], root),
+          git(["status", "--porcelain"], root),
+          git(["stash", "list", `--format=${STASHES}`], root),
+        ]);
         if (key() !== context) return;
         if (log.code !== 0) throw new Error(log.stderr.trim());
         const commits = log.stdout.replace(/\n$/, "").split("\n").filter(Boolean).map((line) => {
-          const [hash, short, parents, refs, subject, author, when] = line.split(SEP);
-          return { key: hash, hash, short, parents: parents.split(" ").filter(Boolean), refs: parseRefs(refs), subject, author, when };
+          const [hash, short, parents, refs, subject, author, when, time] = line.split(SEP);
+          return { key: hash, hash, short, parents: parents.split(" ").filter(Boolean), refs: parseRefs(refs), subject, author, when, time: +time };
         });
-        const laid = layout(commits);
+        const stashes = stash.code !== 0 ? [] : stash.stdout.split("\n").filter(Boolean).map((line) => {
+          const [hash, ref, parents, subject, when, time] = line.split(SEP);
+          // "WIP on main: 340d4d7 fix(...)" says no more than "WIP on main"; a named stash keeps its name.
+          const label = subject.replace(/^(WIP on [^:]+): [0-9a-f]+ .*$/, "$1");
+          return { key: `stash-${hash}`, hash, kind: "stash", ref, short: hash.slice(0, 7), parents: parents.split(" ").slice(0, 1), refs: [], subject: label, author: ref, when, time: +time };
+        });
+        const laid = layout(withPending(commits, status.code === 0 ? statusCounts(status.stdout) : null, stashes));
         this.branch = branch.stdout.trim() || "HEAD detached";
         this.locals = heads.code === 0 ? heads.stdout.split("\n").filter(Boolean) : [];
         this.rows = laid.rows; this.lanes = laid.width;
         this.error = null;
+        if (this.picked && !this.rows.some((r) => r.hash === this.picked)) { this.picked = null; this.detail = null; this.files = null; }
+        else if (this.picked === "wip") this.loadFiles(cx);
       } catch (e) { if (key() === context) this.error = String(e.message ?? e); }
       finally {
         this.loading = false; cx.notify();
@@ -171,14 +254,19 @@ export default class GitGraph extends View {
     this.refresh(cx); cx.notify();
   }
 
-  pick(hash, cx) {
-    if (!this.rows.some((row) => row.hash === hash)) return;
-    if (this.picked === hash) { this.picked = null; this.detail = null; cx.notify(); return; }
-    this.picked = hash; this.detail = null;
+  pick(key, cx) {
+    const row = this.rows.find((r) => r.key === key);
+    if (!row) return;
+    const hash = row.hash;
+    if (this.picked === hash) { this.picked = null; this.detail = null; this.files = null; cx.notify(); return; }
+    this.picked = hash; this.detail = null; this.files = null;
+    if (row.kind === "wip") { this.loadFiles(cx); cx.notify(); return; }
     const root = this.root, on = this.on;
     cx.spawn(async (cx) => {
       try {
-        const r = await exec("git", [...READ, "show", "--stat=70", "--format=%an <%ae>%n%ad%n%n%B", "--date=format:%Y-%m-%d %H:%M", hash, "--"], { cwd: root, on });
+        const args = row.kind === "stash" ? ["stash", "show", "--stat=70", "--include-untracked", hash]
+          : ["show", "--stat=70", "--format=%an <%ae>%n%ad%n%n%B", "--date=format:%Y-%m-%d %H:%M", hash, "--"];
+        const r = await exec("git", [...READ, ...args], { cwd: root, on });
         if (this.picked !== hash) return;
         this.detail = (r.code === 0 ? r.stdout : r.stderr).replace(/\n+$/, "").split("\n");
       } catch (e) { if (this.picked === hash) this.detail = [String(e)]; }
@@ -187,17 +275,52 @@ export default class GitGraph extends View {
     cx.notify();
   }
 
+  // The working directory's files, for its detail (again on every refresh while it's open).
+  loadFiles(cx) {
+    const root = this.root, on = this.on;
+    cx.spawn(async (cx) => {
+      try {
+        const files = await workingFiles((args) => exec("git", [...READ, ...args], { cwd: root, on }));
+        if (this.picked === "wip" && this.root === root) { this.files = files; this.detail = null; }
+      } catch (e) { if (this.picked === "wip") this.detail = [String(e.message ?? e)]; }
+      cx.notify();
+    });
+  }
+
+  // One changed file: what happened to it, its folder dim and its name bright, the lines it changes.
+  fileRow(f, t) {
+    const icon = { added: ["+", t.ansi2], deleted: ["−", t.ansi1], modified: ["✎", t.ansi3] }[f.kind];
+    const cut = f.path.lastIndexOf("/") + 1;
+    return h_flex().h(22).flex_none().gap(8).items_center()
+      .child(div().w(12).flex_none().text_center().text_size(13).font_semibold().text_color(icon[1]).child(icon[0]))
+      .child(h_flex().flex_1().min_w(0).items_center().text_size(12.5)
+        .when(cut > 0, (e) => e.child(div().min_w(0).flex_shrink(1).truncate().text_color(t.dim).child(f.path.slice(0, cut))))
+        .child(div().flex_none().text_color(t.foreground).child(f.path.slice(cut))))
+      .child(h_flex().flex_none().gap(6).text_size(11)
+        .when(f.binary, (e) => e.child(div().text_color(t.dim).child("binary")))
+        .when(!f.binary && f.add > 0, (e) => e.child(div().text_color(t.ansi2).child(`+${f.add}`)))
+        .when(!f.binary && f.del > 0, (e) => e.child(div().text_color(t.ansi1).child(`−${f.del}`))));
+  }
+
   // The right-click menu for a row, as a popup at the pointer.
-  contextMenu(hash) {
-    const row = this.rows.find((r) => r.hash === hash);
-    if (!row || !this.root) return;
-    const menu = { root: this.root, on: this.on ?? null, hash: row.hash, short: row.short, subject: row.subject, refs: row.refs, locals: this.locals ?? [] };
+  contextMenu(key) {
+    const row = this.rows.find((r) => r.key === key);
+    if (!row || !this.root || row.kind === "wip") return;
+    const menu = { root: this.root, on: this.on ?? null, hash: row.hash, short: row.short, subject: row.subject, refs: row.refs, locals: this.locals ?? [], stash: row.kind === "stash" ? row.ref : null };
     openOverlay({ mod: "git-graph", kind: "popup", width: 280, height: menuHeight(menuItems(menu).length), props: { menu } });
   }
 
   open() {
     if (!this.picked) return;
-    run("pane.split", { direction: "down", argv: ["git", "show", this.picked] });
+    const row = this.rows.find((r) => r.hash === this.picked);
+    const argv = row?.kind === "wip" ? ["git", "status"] : row?.kind === "stash" ? ["git", "stash", "show", "-p", "--include-untracked", this.picked] : ["git", "show", this.picked];
+    run("pane.split", { direction: "down", argv });
+  }
+
+  wipTitle() {
+    if (!this.files) return "Working directory";
+    const n = this.files.length, add = this.files.reduce((s, f) => s + f.add, 0), del = this.files.reduce((s, f) => s + f.del, 0);
+    return `Working directory · ${n} ${n === 1 ? "file" : "files"} · +${add} −${del}`;
   }
 
   rowWidth() { return Math.max(200, (this.size?.width ?? 640) - 2); }
@@ -207,9 +330,10 @@ export default class GitGraph extends View {
   // down their lane; a line to or from another lane bends with a rounded elbow at the dot's height.
   graph(row, t) {
     const x = (lane) => PAD + lane * LANE, mid = ROW / 2;
-    const line = ({ from, to, color, kind }) => {
+    const line = ({ from, to, color, dashed, kind }) => {
       const x1 = x(from), x2 = x(to);
       let p = PathBuilder.stroke(STROKE);
+      if (dashed) p = p.dash_array(DASH);
       if (kind === "through") p = p.move_to(x1, 0).line_to(x1, ROW);
       else if (x1 === x2) p = kind === "in" ? p.move_to(x1, 0).line_to(x1, mid) : p.move_to(x1, mid).line_to(x1, ROW);
       else if (kind === "out") {
@@ -228,9 +352,14 @@ export default class GitGraph extends View {
     // Lanes passing straight through first, so the elbows and the dot sit on top.
     const lines = [...row.lines].sort((a, b) => (a.kind === "through") === (b.kind === "through") ? 0 : a.kind === "through" ? -1 : 1);
     const head = row.refs.some((r) => r.kind === "head");
-    const dot = div().absolute().left(x(row.lane) - DOT / 2).top(mid - DOT / 2).w(DOT).h(DOT).rounded_full().bg(t[row.color])
-      .border_2().border_color(head ? t.foreground : t.background);
-    return div().relative().flex_none().w(this.graphWidth()).h(ROW).children(lines.map(line)).child(dot);
+    // The working directory: a dotted ring. A stash: a dotted box with a tray. A commit: a dot.
+    const S = row.kind === "stash" ? 16 : DOT;
+    const dot = div().absolute().left(x(row.lane) - S / 2).top(mid - S / 2).w(S).h(S);
+    const mark = row.kind === "wip" ? dot.rounded_full().bg(t.background).border_2().border_dashed().border_color(t.muted)
+      : row.kind === "stash" ? dot.rounded(4).bg(t.background).border_1().border_dashed().border_color(t.muted).flex().items_center().justify_center()
+        .child(svg("mods/git-graph/stash.svg").w(10).h(10).text_color(t.muted))
+      : dot.rounded_full().bg(t[row.color]).border_2().border_color(head ? t.foreground : t.background);
+    return div().relative().flex_none().w(this.graphWidth()).h(ROW).children(lines.map(line)).child(mark);
   }
 
   chip(ref, row, t) {
@@ -243,13 +372,21 @@ export default class GitGraph extends View {
       .child(div().text_size(10).child(ref.name));
   }
 
+  // The working directory's counts, GitKraken style: ✎ modified, + added, − deleted.
+  counts(n, t) {
+    const one = (sign, count, color) => count ? div().flex_none().text_size(11).text_color(color).child(`${sign} ${count}`) : null;
+    return h_flex().flex_none().gap(8).items_center()
+      .children([one("✎", n.modified, t.ansi3), one("+", n.added, t.ansi2), one("−", n.deleted, t.ansi1)].filter(Boolean));
+  }
+
   row(row, t, font) {
-    const picked = row.hash === this.picked, head = row.refs.some((r) => r.kind === "head");
+    const picked = row.hash === this.picked, head = row.refs.some((r) => r.kind === "head"), pending = Boolean(row.kind);
     return h_flex().w(this.rowWidth()).h(ROW).flex_none().pr(12).gap(8).items_center().cursor_pointer()
       .when(picked, (e) => e.bg(t.selected))
       .child(this.graph(row, t))
       .children(row.refs.slice(0, 4).map((ref) => this.chip(ref, row, t)))
-      .child(div().flex_1().min_w(0).truncate().text_size(12).when(head, (e) => e.font_semibold()).child(row.subject))
+      .when(row.kind === "wip", (e) => e.child(div().flex_none().text_size(12).text_color(t.muted).italic().child(row.subject)).child(this.counts(row.counts, t)).child(div().flex_1()))
+      .when(row.kind !== "wip", (e) => e.child(div().flex_1().min_w(0).truncate().text_size(12).when(head, (e) => e.font_semibold()).when(pending, (e) => e.text_color(t.muted).italic()).child(row.subject)))
       .when(this.rowWidth() >= 560, (e) => e.child(div().flex_none().max_w(120).truncate().text_size(11).text_color(t.muted).child(row.author)))
       .when(this.rowWidth() >= 440, (e) => e.child(div().flex_none().w(96).text_right().text_size(11).text_color(t.dim).child(row.when)))
       .child(div().flex_none().font_family(font).text_size(11).text_color(t.dim).child(row.short.slice(0, 7)));
@@ -281,10 +418,13 @@ export default class GitGraph extends View {
         .when(!rows.length, (e) => e.child(div().absolute().top(8).px(14).text_color(t.dim).child(empty))))
       .when(Boolean(this.picked), (e) => e.child(v_flex().flex_none().h(210).border_t(1).border_color(t.border)
         .child(h_flex().h(30).flex_none().px(12).gap(8).items_center()
-          .child(div().flex_1().min_w(0).truncate().font_family(font).text_size(11).text_color(t.muted).child(this.picked))
+          .child(div().flex_1().min_w(0).truncate().font_family(font).text_size(11).text_color(t.muted)
+            .child(this.picked === "wip" ? this.wipTitle() : this.rows.find((r) => r.hash === this.picked)?.kind === "stash" ? `${this.rows.find((r) => r.hash === this.picked).ref} · ${this.picked}` : this.picked))
           .child(button("detail-open", "Open in terminal", false).on_click(() => this.open()))
-          .child(button("detail-close", "×", false).on_click((_e, cx) => { this.picked = null; this.detail = null; cx.notify(); })))
-        .child(v_flex().id("git-graph-detail").flex_1().min_h(0).overflow_y_scrollbar().px(12).pb(8).font_family(font).text_size(11)
-          .children((this.detail ?? ["Loading…"]).map((line, i) => div().h(16).flex_none().truncate().text_color(i < 2 ? t.muted : t.foreground).child(line.replace(/ /g, " ") || " "))))));
+          .child(button("detail-close", "×", false).on_click((_e, cx) => { this.picked = null; this.detail = null; this.files = null; cx.notify(); })))
+        .when(Boolean(this.files), (e) => e.child(v_flex().id("git-graph-files").flex_1().min_h(0).overflow_y_scrollbar().px(12).pb(8)
+          .children((this.files ?? []).map((f) => this.fileRow(f, t)))))
+        .when(!this.files, (e) => e.child(v_flex().id("git-graph-detail").flex_1().min_h(0).overflow_y_scrollbar().px(12).pb(8).font_family(font).text_size(11)
+          .children((this.detail ?? ["Loading…"]).map((line, i) => div().h(16).flex_none().truncate().text_color(i < 2 ? t.muted : t.foreground).child(line.replace(/ /g, " ") || " ")))))));
   }
 }
