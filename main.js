@@ -1,13 +1,16 @@
 import { View, div, svg, PathBuilder } from "gpui-kit";
 import { v_flex, h_flex, Scrollbar, v_virtual_list } from "gpui-base";
-import { spaces, panes, focused, exec, watchFolder, theme, settings, run } from "herdr";
+import { spaces, panes, focused, exec, watchFolder, theme, settings, run, props, openOverlay } from "herdr";
+import { menuItems, menuHeight, renderMenu } from "./menu.js";
 
 const LIMIT = 300;
 const ROW = 26;
 const LANE = 16;      // px between lanes
 const PAD = 12;       // px before the first lane
-const DOT = 9;
+const DOT = 12;
 const STROKE = 2;
+const BEND = 7;       // elbow radius
+const K = 0.5523;     // cubic bezier handle for a quarter circle
 // Reads write nothing under .git, so the folder watch never triggers itself.
 const READ = ["--no-optional-locks", "-c", "core.fsmonitor=false"];
 const SEP = "\u0001";
@@ -32,10 +35,12 @@ function parseRefs(text) {
   });
 }
 
-// Lays the commits out on lanes, GitKraken style: each lane (column) waits for one commit; a commit
-// takes its lane, hands it to its first parent and opens or joins lanes for the other parents.
-// Columns stay put: a lane that ends leaves a hole the next new lane fills, so only real branch and
-// merge edges curve. Each row records the lines to draw from its top edge to its bottom edge.
+// Lays the commits out on lanes, GitKraken style: each lane (column) waits for one commit and runs
+// straight down. A commit takes the leftmost lane waiting for it; other lanes waiting for it end in an
+// elbow into its dot ("in"). It hands its lane to its first parent and opens or joins lanes for the
+// other parents with an elbow out of its dot ("out"). Lanes never shift sideways between rows, so the
+// only bends are those elbows, on the commit's own row. Several lanes may wait for the same commit
+// (a branch and the line it forked from): they run side by side and meet at that commit.
 function layout(commits) {
   const at = new Map(commits.map((c, i) => [c.hash, i])), byHash = new Map(commits.map((c) => [c.hash, c]));
   // Whether the lane waiting for `from` reaches `target` by first parents before passing its row.
@@ -46,43 +51,39 @@ function layout(commits) {
   };
   let lanes = [], colors = [], paint = 0, width = 1;
   const nextColor = () => PALETTE[paint++ % PALETTE.length];
-  const open = (next, nextColors, hash) => {
-    let k = next.indexOf(null);
-    if (k < 0) k = next.length;
-    next[k] = hash; nextColors[k] = nextColor();
-    return k;
-  };
   const rows = commits.map((c) => {
     const top = lanes, topColors = colors;
     const next = top.slice(), nextColors = topColors.slice();
-    let idx = top.indexOf(c.hash), fresh = idx < 0;
-    if (fresh) idx = open(next, nextColors, c.hash);
+    // A new lane takes the first free column, also one a lane ending on this row frees: its elbow in
+    // and the new elbow out meet at the dot in a "}".
+    const open = (hash) => {
+      let k = next.indexOf(null);
+      if (k < 0) k = next.length;
+      next[k] = hash; nextColors[k] = nextColor();
+      return k;
+    };
+    const waiting = [];
+    top.forEach((h, k) => { if (h === c.hash) waiting.push(k); });
+    const fresh = !waiting.length;
+    const idx = fresh ? open(c.hash) : waiting[0];
     const color = nextColors[idx];
-    const lines = [], out = [];
-    const [first, ...rest] = c.parents;
-    if (!first) next[idx] = null;
-    else {
-      const j = next.indexOf(first);
-      if (j < 0 || j === idx) { next[idx] = first; out.push(first); }
-      else if (j < idx) { next[idx] = null; out.push(first); }            // join the lane on the left
-      else { next[idx] = first; next[j] = null; nextColors[j] = null; }  // the lane on the right joins this one
-      for (const p of rest) {
-        if (!next.includes(p)) {
-          // A merge from a branch that is still on its way down: join that lane instead of opening one.
-          const k = next.findIndex((h, i) => h && i !== idx && at.has(p) && reaches(h, p));
-          if (k >= 0) { out.push(next[k]); continue; }
-          open(next, nextColors, p);
-        }
-        out.push(p);
-      }
-    }
+    const lines = [];
+    for (const k of waiting.slice(1)) { next[k] = null; nextColors[k] = null; lines.push({ from: k, to: idx, color: topColors[k], kind: "in" }); }
     for (let k = 0; k < top.length; k++) {
-      if (k === idx || top[k] === null) continue;
-      const to = next.indexOf(top[k]);
-      if (to >= 0) lines.push({ from: k, to, color: topColors[k], kind: "through" });
+      if (top[k] !== null && top[k] !== c.hash) lines.push({ from: k, to: k, color: topColors[k], kind: "through" });
     }
     if (!fresh) lines.push({ from: idx, to: idx, color, kind: "in" });
-    for (const p of out) { const to = next.indexOf(p); lines.push({ from: idx, to, color: nextColors[to], kind: "out" }); }
+    const [first, ...rest] = c.parents;
+    next[idx] = first ?? null;
+    if (first) lines.push({ from: idx, to: idx, color, kind: "out" });
+    else nextColors[idx] = null;
+    for (const p of rest) {
+      let k = next.findIndex((h, i) => h === p && i !== idx);
+      // A merge from a branch that is still on its way down: join that lane instead of opening one.
+      if (k < 0) k = next.findIndex((h, i) => h && i !== idx && at.has(p) && reaches(h, p));
+      if (k < 0) k = open(p);
+      lines.push({ from: idx, to: k, color: nextColors[k], kind: "out" });
+    }
     while (next.length && next[next.length - 1] === null) { next.pop(); nextColors.pop(); }
     width = Math.max(width, top.length, next.length);
     lanes = next; colors = nextColors;
@@ -93,6 +94,8 @@ function layout(commits) {
 
 export default class GitGraph extends View {
   init(_props, cx) {
+    // Opened as the right-click menu of a commit (see menu.js) rather than as the panel.
+    if (props()?.menu) { this.menu = true; this.at = 0; this.handle = cx.focus_handle(); this.handle.focus(); return; }
     this.rows = []; this.lanes = 1; this.all = localStorage.getItem("all") === "1";
     this.refresh(cx);
     cx.timer.every(15000, (cx) => this.refresh(cx));
@@ -141,6 +144,7 @@ export default class GitGraph extends View {
         }
         const root = this.root;
         const branch = await git(["branch", "--show-current"], root);
+        const heads = await git(["for-each-ref", "--format=%(refname:short)", "refs/heads"], root);
         const refs = this.all ? ["--all"] : ["HEAD", ...(this.base ? [this.base] : [])];
         const log = await git(["log", "--date-order", `--format=${FORMAT}`, "-n", String(LIMIT), ...refs, "--"], root);
         if (key() !== context) return;
@@ -151,6 +155,7 @@ export default class GitGraph extends View {
         });
         const laid = layout(commits);
         this.branch = branch.stdout.trim() || "HEAD detached";
+        this.locals = heads.code === 0 ? heads.stdout.split("\n").filter(Boolean) : [];
         this.rows = laid.rows; this.lanes = laid.width;
         this.error = null;
       } catch (e) { if (key() === context) this.error = String(e.message ?? e); }
@@ -182,6 +187,14 @@ export default class GitGraph extends View {
     cx.notify();
   }
 
+  // The right-click menu for a row, as a popup at the pointer.
+  contextMenu(hash) {
+    const row = this.rows.find((r) => r.hash === hash);
+    if (!row || !this.root) return;
+    const menu = { root: this.root, on: this.on ?? null, hash: row.hash, short: row.short, subject: row.subject, refs: row.refs, locals: this.locals ?? [] };
+    openOverlay({ mod: "git-graph", kind: "popup", width: 280, height: menuHeight(menuItems(menu).length), props: { menu } });
+  }
+
   open() {
     if (!this.picked) return;
     run("pane.split", { direction: "down", argv: ["git", "show", this.picked] });
@@ -190,20 +203,34 @@ export default class GitGraph extends View {
   rowWidth() { return Math.max(200, (this.size?.width ?? 640) - 2); }
   graphWidth() { return PAD * 2 + (Math.min(this.lanes, 14) - 1) * LANE; }
 
-  // One row of the graph: the lanes' lines as native paths, the commit as a dot.
+  // One row of the graph: the lanes' lines as native paths, the commit as a dot. Lines are straight
+  // down their lane; a line to or from another lane bends with a rounded elbow at the dot's height.
   graph(row, t) {
     const x = (lane) => PAD + lane * LANE, mid = ROW / 2;
     const line = ({ from, to, color, kind }) => {
       const x1 = x(from), x2 = x(to);
-      const y1 = kind === "out" ? mid : 0, y2 = kind === "in" ? mid : ROW;
-      let p = PathBuilder.stroke(STROKE).move_to(x1, y1);
-      if (x1 === x2) p = p.line_to(x2, y2);
-      else p = p.cubic_bezier_to(x2, y2, x1, (y1 + y2) / 2 + (kind === "out" ? 6 : 0), x2, (y1 + y2) / 2);
+      let p = PathBuilder.stroke(STROKE);
+      if (kind === "through") p = p.move_to(x1, 0).line_to(x1, ROW);
+      else if (x1 === x2) p = kind === "in" ? p.move_to(x1, 0).line_to(x1, mid) : p.move_to(x1, mid).line_to(x1, ROW);
+      else if (kind === "out") {
+        // Out of the dot sideways, then down the lane it opens or joins.
+        const d = Math.sign(x2 - x1);
+        p = p.move_to(x1, mid).line_to(x2 - d * BEND, mid)
+          .cubic_bezier_to(x2, mid + BEND, x2 - d * BEND * (1 - K), mid, x2, mid + BEND * (1 - K)).line_to(x2, ROW);
+      } else {
+        // Down its lane, then sideways into the dot.
+        const d = Math.sign(x2 - x1);
+        p = p.move_to(x1, 0).line_to(x1, mid - BEND)
+          .cubic_bezier_to(x1 + d * BEND, mid, x1, mid - BEND * (1 - K), x1 + d * BEND * (1 - K), mid).line_to(x2, mid);
+      }
       return window.paint_path(p.build(), t[color]).absolute().top(0).left(0).size_full();
     };
+    // Lanes passing straight through first, so the elbows and the dot sit on top.
+    const lines = [...row.lines].sort((a, b) => (a.kind === "through") === (b.kind === "through") ? 0 : a.kind === "through" ? -1 : 1);
+    const head = row.refs.some((r) => r.kind === "head");
     const dot = div().absolute().left(x(row.lane) - DOT / 2).top(mid - DOT / 2).w(DOT).h(DOT).rounded_full().bg(t[row.color])
-      .when(row.refs.some((r) => r.kind === "head"), (e) => e.border_2().border_color(t.foreground));
-    return div().relative().flex_none().w(this.graphWidth()).h(ROW).children(row.lines.map(line)).child(dot);
+      .border_2().border_color(head ? t.foreground : t.background);
+    return div().relative().flex_none().w(this.graphWidth()).h(ROW).children(lines.map(line)).child(dot);
   }
 
   chip(ref, row, t) {
@@ -229,6 +256,7 @@ export default class GitGraph extends View {
   }
 
   render(cx) {
+    if (this.menu) return renderMenu(this, cx);
     if (key() !== this.context) this.refresh(cx);
     const t = theme(), font = settings().font_family ?? "JetBrains Mono";
     const rows = this.rows;
@@ -247,7 +275,8 @@ export default class GitGraph extends View {
           .child(button("mode-all", "All", this.all).on_click((_e, cx) => { if (!this.all) this.toggle(cx); }))))
       .child(div().flex_1().min_h(0).relative()
         .child(v_virtual_list("git-graph-rows", rows.length, ROW, (i) => rows[i].key,
-          (range) => rows.slice(range.start, range.end).map((row) => this.row(row, t, font))).size_full().on_item_click((key, cx) => this.pick(key, cx)))
+          (range) => rows.slice(range.start, range.end).map((row) => this.row(row, t, font))).size_full().on_item_click((key, cx) => this.pick(key, cx))
+          .on_item_secondary_click((key, _e, cx) => { cx.stop_propagation(); this.contextMenu(key); }))
         .child(Scrollbar.vertical("git-graph-rows").absolute().inset_0())
         .when(!rows.length, (e) => e.child(div().absolute().top(8).px(14).text_color(t.dim).child(empty))))
       .when(Boolean(this.picked), (e) => e.child(v_flex().flex_none().h(210).border_t(1).border_color(t.border)
