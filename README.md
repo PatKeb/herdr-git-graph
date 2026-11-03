@@ -2,7 +2,7 @@
 
 A [Herdr](https://herdr.dev) mod that draws a GitKraken-style commit graph (lanes, branch/merge curves, refs) for the repo of the focused terminal or space.
 
-Uncommitted changes show as a dotted `// WIP` row on top (✎ modified, + added, − deleted), and each stash as a dotted box above the commit it was made on; right-click a stash to apply, pop or delete it.
+Uncommitted changes show as a dotted `// WIP` row on top (✎ modified, + added, − deleted), and each stash as a dotted box above the commit it was made on; right-click a stash to apply, pop or delete it. Clicking the WIP row lists the changed files with their line counts; click a file for its diff. A commit lists its files the same way.
 
 Click a commit for its details; right-click it to check out its branch (local, or a remote one as a new tracking branch) or the commit itself, detached.
 
