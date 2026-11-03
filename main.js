@@ -1,6 +1,7 @@
 import { View, div, svg, PathBuilder } from "gpui-kit";
 import { v_flex, h_flex, Scrollbar, v_virtual_list } from "gpui-base";
-import { spaces, panes, focused, exec, watchFolder, theme, settings, run, props, openOverlay, notify } from "herdr";
+import { spaces, panes, focused, exec, watchFolder, theme, settings, run, props, openOverlay, notify, home } from "herdr";
+import { spaceOptions, optionsVersion, usesNested, setOption, shortFolder } from "./space-options.js";
 import { menuItems, menuHeight, renderMenu } from "./menu.js";
 import { diffRows, diffRow } from "./diff.js";
 
@@ -27,9 +28,26 @@ function location() {
   const space = spaces().find((s) => s.active), f = focused();
   const pane = f?.pane ? panes().find((p) => p.pane === f.pane) : null;
   const on = f?.pane === null ? (f.terminal?.includes("/") ? f.terminal.split("/")[0] : null) : space?.machine ?? null;
-  return { cwd: pane?.cwd || f?.cwd || space?.folder, on };
+  return { cwd: pane?.cwd || f?.cwd || space?.folder, on, folder: space?.folder ?? null };
 }
-const key = () => JSON.stringify(location());
+// Bumped when a repo tab is picked, so a refresh still reading the previous repo is dropped.
+let picks = 0;
+const key = () => JSON.stringify({ ...location(), nested: optionsVersion(), picks });
+
+// Folders that hold several repos (e.g. project/{landing,be,fe}), when turned on in
+// space-options.json ("nested"): their direct children with a .git, a tab each (as in changes-multi).
+const strip = (p) => p.replace(/\/+$/, "");
+const inside = (path, dir) => Boolean(dir) && (path === dir || path.startsWith(strip(dir) + "/"));
+const baseName = (path) => strip(path).split("/").pop();
+const SKIP = ["node_modules", "vendor", ".git"];
+async function nestedRepos(dir, on) {
+  const r = await exec("find", [dir, "-mindepth", "2", "-maxdepth", "2", "-name", ".git"], { cwd: dir, on }).catch(() => null);
+  if (!r || !r.stdout) return [];
+  return r.stdout.split("\n").filter(Boolean).map((p) => p.replace(/\/\.git$/, ""))
+    .filter((p) => !SKIP.includes(baseName(p))).sort((a, b) => baseName(a).localeCompare(baseName(b))).slice(0, 30);
+}
+// The repo tab last picked per folder of repos, kept across restarts.
+function pickedRepos() { try { return JSON.parse(localStorage.getItem("repo-picked") || "{}") || {}; } catch { return {}; } }
 
 function parseRefs(text) {
   return text.split(", ").filter(Boolean).map((ref) => {
@@ -200,7 +218,7 @@ export default class GitGraph extends View {
   init(_props, cx) {
     // Opened as the right-click menu of a commit (see menu.js) rather than as the panel.
     if (props()?.menu) { this.menu = true; this.at = 0; this.handle = cx.focus_handle(); this.handle.focus(); return; }
-    this.rows = []; this.lanes = 1; this.all = localStorage.getItem("all") === "1";
+    this.rows = []; this.repos = []; this.lanes = 1; this.all = localStorage.getItem("all") === "1";
     this.refresh(cx);
     cx.timer.every(15000, (cx) => this.refresh(cx));
   }
@@ -234,10 +252,11 @@ export default class GitGraph extends View {
 
   refresh(cx) {
     if (this.loading) { this.again = true; return; }
-    const { cwd, on } = location(), context = key();
+    const { cwd, on, folder } = location(), context = key();
     if (context !== this.context) {
       this.context = context; this.root = null; this.base = null; this.branch = null; this.rows = []; this.error = null;
       this.watched = null; this.picked = null; this.detail = null; this.files = null; this.diff = null;
+      this.repos = []; this.candidate = null; this.pickKey = null;
     }
     if (!cwd) return;
     this.loading = true;
@@ -245,10 +264,26 @@ export default class GitGraph extends View {
       try {
         const git = (args, dir = cwd) => exec("git", [...READ, ...args], { cwd: dir, on });
         if (!this.root) {
-          const top = await git(["rev-parse", "--show-toplevel", "--absolute-git-dir"]);
+          const top = await git(["rev-parse", "--show-toplevel"]);
+          const here = top.code === 0 ? top.stdout.trim() : null;
+          // Where to look for sibling repos: the nearest folder turned on in space-options.json
+          // ("nested"), from the terminal's folder up to the space's (as in changes-multi).
+          const isHome = (dir) => !on && strip(dir) === strip(home());
+          let scan = null;
+          for (let dir = strip(cwd); dir; dir = dir.slice(0, dir.lastIndexOf("/"))) {
+            if (!isHome(dir) && usesNested(cx, dir)) { scan = dir; break; }
+            if (!inside(dir, folder) || dir === strip(folder)) break;
+          }
+          // Not a repo and not turned on: offered as a folder of repos.
+          this.candidate = here || scan || isHome(cwd) ? null : cwd;
+          const found = scan ? await nestedRepos(scan, on) : [];
+          if (here && !found.includes(here)) found.unshift(here);
           if (key() !== context) return;
-          if (top.code !== 0) { this.error = "Not a git repository"; return; }
-          const [root] = top.stdout.trim().split("\n");
+          this.repos = found.map((path) => ({ path, name: baseName(path) }));
+          this.pickKey = scan ?? here;
+          if (!found.length) { this.error = "Not a git repository"; return; }
+          const saved = pickedRepos()[this.pickKey];
+          const root = found.includes(saved) ? saved : here ?? found[0];
           this.root = root; this.on = on;
           // The branch the current one is compared against: origin's default, else main/master.
           const head = await git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], root);
@@ -319,6 +354,28 @@ export default class GitGraph extends View {
   toggle(cx) {
     this.all = !this.all; localStorage.setItem("all", this.all ? "1" : "0");
     this.refresh(cx); cx.notify();
+  }
+
+  // A repo tab (in a folder of repos): remembered per folder; the graph starts over for it.
+  pickRepo(path, cx) {
+    if (path === this.root || !this.pickKey) return;
+    const all = pickedRepos();
+    all[this.pickKey] = path;
+    try { localStorage.setItem("repo-picked", JSON.stringify(all)); } catch {}
+    picks++;
+    this.refresh(cx); cx.notify();
+  }
+
+  repoTabs(t) {
+    return h_flex().id("repo-tabs").flex_none().flex_wrap().px(8).py(6).gap(4).border_b(1).border_color(t.border)
+      .children(this.repos.map((r) => {
+        const active = r.path === this.root;
+        return h_flex().id(`repo-${r.path}`).h(24).px(8).items_center().rounded(6).cursor_pointer().text_size(12)
+          .border_1().border_color(active ? t.accent : t.border).when(active, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover))
+          .text_color(active ? t.foreground : t.muted)
+          .on_click((_e, cx) => this.pickRepo(r.path, cx))
+          .child(r.name);
+      }));
   }
 
   pick(key, cx) {
@@ -525,6 +582,7 @@ export default class GitGraph extends View {
 
   render(cx) {
     if (this.menu) return renderMenu(this, cx);
+    spaceOptions(cx);
     if (key() !== this.context) this.refresh(cx);
     const t = theme(), font = settings().font_family ?? "JetBrains Mono";
     const rows = this.rows;
@@ -542,6 +600,13 @@ export default class GitGraph extends View {
         .child(h_flex().flex_none().gap(2).p(2).rounded(6).border_1().border_color(t.border)
           .child(button("mode-branch", this.base ? `vs ${this.base}` : "Branch", !this.all).on_click((_e, cx) => { if (this.all) this.toggle(cx); }))
           .child(button("mode-all", "All", this.all).on_click((_e, cx) => { if (!this.all) this.toggle(cx); }))))
+      .when((this.repos?.length ?? 0) > 1, (e) => e.child(this.repoTabs(t)))
+      // Not a repo, but maybe a folder of repos: offer to read it as one (shared with Changes).
+      .when(!this.root && !this.loading && Boolean(this.candidate) && !(this.repos?.length), (e) => e.child(
+        h_flex().flex_none().px(14).pt(8).child(div().id("repo-nested-on").px(10).h(26).flex().items_center().rounded(6).cursor_pointer().text_size(12)
+          .border_1().border_color(t.border).text_color(t.foreground).hover((s) => s.bg(t.hover))
+          .on_click(() => { setOption("nested", this.candidate, true).catch((err) => notify({ title: "Couldn't save the setting", body: String(err), level: "error" })); })
+          .child(`Use repos inside ${shortFolder(this.candidate ?? "")}`))))
       .child(div().flex_1().min_h(0).relative()
         .child(v_virtual_list("git-graph-rows", rows.length, ROW, (i) => rows[i].key,
           (range) => rows.slice(range.start, range.end).map((row) => this.row(row, t, font))).size_full().on_item_click((key, cx) => this.pick(key, cx))

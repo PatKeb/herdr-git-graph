@@ -6,6 +6,8 @@ Uncommitted changes show as a dotted `// WIP` row on top (✎ modified, + added,
 
 Pull (the current branch) and Stash (everything uncommitted, untracked files too) sit above the graph.
 
+A folder of several repos (e.g. `project/{be,fe,landing}`) shows a tab per repo above the graph, once it's turned on in `~/.config/herdr-app/space-options.json` (`"nested"`, shared with the Changes panel; the graph offers a button for it). The nearest such folder from the terminal's up to the space's is used.
+
 Click a commit for its details; right-click it to check out its branch (local, or a remote one as a new tracking branch) or the commit itself, detached.
 
 ## Install
