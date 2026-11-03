@@ -1,6 +1,6 @@
 import { View, div, svg, PathBuilder } from "gpui-kit";
 import { v_flex, h_flex, Scrollbar, v_virtual_list } from "gpui-base";
-import { spaces, panes, focused, exec, watchFolder, theme, settings, run, props, openOverlay } from "herdr";
+import { spaces, panes, focused, exec, watchFolder, theme, settings, run, props, openOverlay, notify } from "herdr";
 import { menuItems, menuHeight, renderMenu } from "./menu.js";
 
 const LIMIT = 300;
@@ -83,10 +83,10 @@ async function workingFiles(git) {
   return files;
 }
 
-// A commit's files, as workingFiles gives them: against its first parent (a merge: what it brought in).
+// The files a `git show` or `git diff` (`args`) changes, as workingFiles gives them.
 const SHOW = ["--format=", "--no-renames", "--diff-merges=first-parent", "-z"];
-async function commitFiles(git, hash) {
-  const [num, names] = await Promise.all([git(["show", ...SHOW, "--numstat", hash, "--"]), git(["show", ...SHOW, "--name-status", hash, "--"])]);
+async function changedFiles(git, args) {
+  const [num, names] = await Promise.all([git([...args, "--numstat", "--"]), git([...args, "--name-status", "--"])]);
   if (names.code !== 0) throw new Error(names.stderr.trim());
   const stats = {};
   for (const entry of num.stdout.split("\0")) {
@@ -101,6 +101,19 @@ async function commitFiles(git, hash) {
     files.push({ path, kind, ...(stats[path] ?? { add: 0, del: 0, binary: false }) });
   }
   return files;
+}
+
+// A commit's files: against its first parent (a merge: what it brought in).
+const commitFiles = (git, hash) => changedFiles(git, ["show", ...SHOW, hash]);
+
+// A stash's files. Git keeps a stash as a commit of the working tree on top of the commit it was made on
+// (^1), and the untracked files, when stashed with them, as a commit of their own (^3), all new.
+async function stashFiles(git, hash, untracked) {
+  const [tracked, fresh] = await Promise.all([
+    changedFiles(git, ["diff", "--no-renames", "-z", `${hash}^1`, hash]),
+    untracked ? changedFiles(git, ["show", ...SHOW, `${hash}^3`]) : [],
+  ]);
+  return [...tracked, ...fresh.map((f) => ({ ...f, untracked: true }))];
 }
 
 // Adds the rows that aren't commits: the working directory's changes on top, waiting for HEAD, and each
@@ -253,7 +266,7 @@ export default class GitGraph extends View {
           const [hash, ref, parents, subject, when, time] = line.split(SEP);
           // "WIP on main: 340d4d7 fix(...)" says no more than "WIP on main"; a named stash keeps its name.
           const label = subject.replace(/^(WIP on [^:]+): [0-9a-f]+ .*$/, "$1");
-          return { key: `stash-${hash}`, hash, kind: "stash", ref, short: hash.slice(0, 7), parents: parents.split(" ").slice(0, 1), refs: [], subject: label, author: ref, when, time: +time };
+          return { key: `stash-${hash}`, hash, kind: "stash", ref, short: hash.slice(0, 7), parents: parents.split(" ").slice(0, 1), untracked: parents.split(" ").length > 2, refs: [], subject: label, author: ref, when, time: +time };
         });
         const laid = layout(withPending(commits, status.code === 0 ? statusCounts(status.stdout) : null, stashes));
         this.branch = branch.stdout.trim() || "HEAD detached";
@@ -267,6 +280,24 @@ export default class GitGraph extends View {
         this.loading = false; cx.notify();
         if (this.again) { this.again = false; this.refresh(cx); }
       }
+    });
+  }
+
+  // Pull and Stash above the graph: run git in the repo, say how it went, show the result.
+  act(name, args, cx) {
+    if (this.action || !this.root) return;
+    const root = this.root, on = this.on, branch = this.branch;
+    this.action = name; cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const r = await exec("git", args, { cwd: root, on });
+        const out = (r.code === 0 ? r.stdout : r.stderr || r.stdout).trim().split("\n").filter(Boolean);
+        if (r.code !== 0) notify({ title: name === "pull" ? `Couldn't pull ${branch}` : "Couldn't stash the changes", body: out.slice(-4).join("\n"), level: "error" });
+        // Pull's last line says what came ("Already up to date." or "3 files changed, …"); stash's first, what it saved.
+        else notify({ title: name === "pull" ? `Pulled ${branch}` : "Stashed the changes", body: (name === "pull" ? out.at(-1) : out[0]) ?? "", level: "success", timeout: 4000 });
+      } catch (e) { notify({ title: name === "pull" ? `Couldn't pull ${branch}` : "Couldn't stash the changes", body: String(e.message ?? e), level: "error" }); }
+      this.action = null; cx.notify();
+      this.refresh(cx);
     });
   }
 
@@ -285,20 +316,14 @@ export default class GitGraph extends View {
     const root = this.root, on = this.on, git = (args) => exec("git", [...READ, ...args], { cwd: root, on });
     cx.spawn(async (cx) => {
       try {
-        if (row.kind === "stash") {
-          const r = await git(["stash", "show", "--stat=70", "--include-untracked", hash]);
-          if (this.picked !== hash) return;
-          this.detail = (r.code === 0 ? r.stdout : r.stderr).replace(/\n+$/, "").split("\n");
-        } else {
-          // Who and when, the message, then its files as the working directory shows them.
-          const [meta, files] = await Promise.all([
-            git(["show", "-s", "--format=%an <%ae>%n%ad%n%n%B", "--date=format:%Y-%m-%d %H:%M", hash, "--"]),
-            commitFiles(git, hash),
-          ]);
-          if (this.picked !== hash) return;
-          this.detail = (meta.code === 0 ? meta.stdout : meta.stderr).replace(/\n+$/, "").split("\n");
-          this.files = files;
-        }
+        // Who and when, the message, then its files as the working directory shows them.
+        const [meta, files] = await Promise.all([
+          git(["show", "-s", "--format=%an <%ae>%n%ad%n%n%B", "--date=format:%Y-%m-%d %H:%M", hash, "--"]),
+          row.kind === "stash" ? stashFiles(git, hash, row.untracked) : commitFiles(git, hash),
+        ]);
+        if (this.picked !== hash) return;
+        this.detail = (meta.code === 0 ? meta.stdout : meta.stderr).replace(/\n+$/, "").split("\n");
+        this.files = files;
       } catch (e) { if (this.picked === hash) this.detail = [String(e.message ?? e)]; }
       cx.notify();
     });
@@ -325,6 +350,9 @@ export default class GitGraph extends View {
   // A changed file's diff against HEAD (a new file: against nothing).
   // A commit's file: what the commit changed in it.
   diffArgs(f) {
+    if (this.rows.find((r) => r.hash === this.picked)?.kind === "stash") {
+      return f.untracked ? ["show", "--format=", `${this.picked}^3`, "--", f.path] : ["diff", `${this.picked}^1`, this.picked, "--", f.path];
+    }
     if (this.picked !== "wip") return ["show", "--format=", "--diff-merges=first-parent", this.picked, "--", f.path];
     return f.untracked ? ["diff", "--no-index", "--", "/dev/null", f.path] : ["diff", "HEAD", "--", f.path];
   }
@@ -398,6 +426,24 @@ export default class GitGraph extends View {
   filesTitle(what) {
     const n = this.files.length, add = this.files.reduce((s, f) => s + f.add, 0), del = this.files.reduce((s, f) => s + f.del, 0);
     return `${what} · ${n} ${n === 1 ? "file" : "files"} · +${add} −${del}`;
+  }
+
+  // Pull (the current branch; not while detached) and Stash (everything uncommitted, untracked files too).
+  actions(t) {
+    const canPull = Boolean(this.root) && this.branch && this.branch !== "HEAD detached";
+    const canStash = this.rows.some((r) => r.kind === "wip");
+    const spin = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    const act = (id, icon, label, enabled, args) => {
+      const running = this.action === id, on = enabled && !this.action;
+      return h_flex().id(`act-${id}`).h(24).px(8).gap(5).items_center().rounded(6).border_1().border_color(t.border).text_size(11)
+        .text_color(on ? t.foreground : t.dim)
+        .when(on, (e) => e.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.act(id, args, cx)))
+        .child(running ? div().w(11).text_center().frames(spin, 90) : svg(`mods/git-graph/${icon}.svg`).w(11).h(11).flex_none().text_color(on ? t.muted : t.dim))
+        .child(label);
+    };
+    return h_flex().flex_none().gap(6)
+      .child(act("pull", "pull", "Pull", canPull, ["pull"]))
+      .child(act("stash", "stash", "Stash", canStash, ["stash", "push", "--include-untracked"]));
   }
 
   rowWidth() { return Math.max(200, (this.size?.width ?? 640) - 2); }
@@ -484,6 +530,7 @@ export default class GitGraph extends View {
         .when(Boolean(this.branch), (e) => e.child(div().min_w(0).truncate().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(this.branch)))
         .child(div().flex_1())
         .when(this.loading, (e) => e.child(div().text_size(11).text_color(t.dim).frames(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"], 90)))
+        .child(this.actions(t))
         .child(h_flex().flex_none().gap(2).p(2).rounded(6).border_1().border_color(t.border)
           .child(button("mode-branch", this.base ? `vs ${this.base}` : "Branch", !this.all).on_click((_e, cx) => { if (this.all) this.toggle(cx); }))
           .child(button("mode-all", "All", this.all).on_click((_e, cx) => { if (!this.all) this.toggle(cx); }))))
@@ -497,7 +544,7 @@ export default class GitGraph extends View {
         .child(h_flex().h(30).flex_none().px(12).gap(8).items_center()
           .when(Boolean(this.diff), (e) => e.child(button("diff-back", "← Files", false).on_click((_e, cx) => { this.diff = null; cx.notify(); })))
           .child(div().flex_1().min_w(0).truncate().font_family(font).text_size(11).text_color(t.muted)
-            .child(this.diff ? this.diff.path : this.picked === "wip" ? this.wipTitle() : this.files ? this.filesTitle(this.picked.slice(0, 10)) : this.rows.find((r) => r.hash === this.picked)?.kind === "stash" ? `${this.rows.find((r) => r.hash === this.picked).ref} · ${this.picked}` : this.picked))
+            .child(this.diff ? this.diff.path : this.picked === "wip" ? this.wipTitle() : this.files ? this.filesTitle(this.rows.find((r) => r.hash === this.picked)?.ref ?? this.picked.slice(0, 10)) : this.picked))
           .child(button("detail-open", "Open in terminal", false).on_click(() => this.open()))
           .child(button("detail-close", "×", false).on_click((_e, cx) => { this.picked = null; this.detail = null; this.files = null; this.diff = null; cx.notify(); })))
         .when(Boolean(this.diff), (e) => e.child(v_flex().id("git-graph-diff").flex_1().min_h(0).overflow_scroll().px(12).pb(8).font_family(font).text_size(11)
