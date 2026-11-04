@@ -6,6 +6,7 @@ import { menuItems, menuHeight, renderMenu } from "./menu.js";
 import { diffRows, diffRow } from "./diff.js";
 
 const LIMIT = 300;
+const STALL = 30000;  // ms a refresh may take before it's given up and started over
 const ROW = 26;
 const LANE = 16;      // px between lanes
 const PAD = 12;       // px before the first lane
@@ -218,7 +219,7 @@ export default class GitGraph extends View {
   init(_props, cx) {
     // Opened as the right-click menu of a commit (see menu.js) rather than as the panel.
     if (props()?.menu) { this.menu = true; this.at = 0; this.handle = cx.focus_handle(); this.handle.focus(); return; }
-    this.rows = []; this.repos = []; this.lanes = 1; this.all = localStorage.getItem("all") === "1";
+    this.rows = []; this.repos = []; this.lanes = 1; this.round = 0; this.all = localStorage.getItem("all") === "1";
     this.refresh(cx);
     cx.timer.every(15000, (cx) => this.refresh(cx));
   }
@@ -260,6 +261,15 @@ export default class GitGraph extends View {
     }
     if (!cwd) return;
     this.loading = true;
+    // A read whose result never comes back (a lost git process) would leave the graph stale for
+    // good: after a while this round is given up and started over; its late result is dropped.
+    const round = ++this.round;
+    this.watchdog?.cancel();
+    this.watchdog = cx.timer.after(STALL, (cx) => {
+      if (this.round !== round || !this.loading) return;
+      this.loading = false; this.again = false;
+      this.refresh(cx);
+    });
     cx.spawn(async (cx) => {
       try {
         const git = (args, dir = cwd) => exec("git", [...READ, ...args], { cwd: dir, on });
@@ -278,7 +288,7 @@ export default class GitGraph extends View {
           this.candidate = here || scan || isHome(cwd) ? null : cwd;
           const found = scan ? await nestedRepos(scan, on) : [];
           if (here && !found.includes(here)) found.unshift(here);
-          if (key() !== context) return;
+          if (key() !== context || this.round !== round) return;
           this.repos = found.map((path) => ({ path, name: baseName(path) }));
           this.pickKey = scan ?? here;
           if (!found.length) { this.error = "Not a git repository"; return; }
@@ -306,7 +316,7 @@ export default class GitGraph extends View {
           git(["status", "--porcelain"], root),
           git(["stash", "list", `--format=${STASHES}`], root),
         ]);
-        if (key() !== context) return;
+        if (key() !== context || this.round !== round) return;
         if (log.code !== 0) throw new Error(log.stderr.trim());
         const commits = log.stdout.replace(/\n$/, "").split("\n").filter(Boolean).map((line) => {
           const [hash, short, parents, refs, subject, author, when, time] = line.split(SEP);
@@ -325,10 +335,13 @@ export default class GitGraph extends View {
         this.error = null;
         if (this.picked && !this.rows.some((r) => r.hash === this.picked)) { this.picked = null; this.detail = null; this.files = null; this.diff = null; }
         else if (this.picked === "wip") this.loadFiles(cx);
-      } catch (e) { if (key() === context) this.error = String(e.message ?? e); }
+      } catch (e) { if (key() === context && this.round === round) this.error = String(e.message ?? e); }
       finally {
-        this.loading = false; cx.notify();
-        if (this.again) { this.again = false; this.refresh(cx); }
+        if (this.round === round) {
+          this.watchdog?.cancel(); this.watchdog = null;
+          this.loading = false; cx.notify();
+          if (this.again) { this.again = false; this.refresh(cx); }
+        }
       }
     });
   }
